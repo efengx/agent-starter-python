@@ -1,137 +1,129 @@
+# src/agent.py
+import asyncio
+import json
 import logging
+from typing import AsyncIterable
+import os
 
 from dotenv import load_dotenv
 from livekit.agents import (
-    NOT_GIVEN,
-    Agent,
-    AgentFalseInterruptionEvent,
-    AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
-    RoomInputOptions,
-    RunContext,
+    JobRequest,
     WorkerOptions,
+    RoomOutputOptions,
     cli,
-    metrics,
+    llm,
+    voice,
 )
-from livekit.agents.llm import function_tool
-from livekit.plugins import cartesia, deepgram, noise_cancellation, openai, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.plugins import openai, silero
+from livekit.agents.llm import ImageContent, AudioContent
+from livekit.agents import Agent
 
-logger = logging.getLogger("agent")
+from module.firstx_human import FxHumanApiClient
+from module.sentence_processor import SentenceStreamProcessor
 
 load_dotenv(".env.local")
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("fx-assistant")
 
-class Assistant(Agent):
-    def __init__(self) -> None:
+class FxAssistant(voice.Agent):
+    def __init__(self, api_client: FxHumanApiClient):
         super().__init__(
-            instructions="""You are a helpful voice AI assistant.
-            You eagerly assist users with their questions by providing information from your extensive knowledge.
-            Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
-            You are curious, friendly, and have a sense of humor.""",
+            instructions="You are a helpful voice AI assistant.",
         )
+        self.api_client = api_client
 
-    # all functions annotated with @function_tool will be passed to the LLM when this
-    # agent is active
-    @function_tool
-    async def lookup_weather(self, context: RunContext, location: str):
-        """Use this tool to look up current weather information in the given location.
-
-        If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-
-        Args:
-            location: The location to look up weather information for (e.g. city name)
+    async def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tool_ctx: llm.ToolContext,
+        model_settings: voice.ModelSettings,
+    ) -> AsyncIterable[llm.ChatChunk]:
         """
+        重写 llm_node 以拦截 LLM 输出流。
+        """
+        original_stream = super().llm_node(chat_ctx, tool_ctx, model_settings)
+        sentence_processor = SentenceStreamProcessor()
 
-        logger.info(f"Looking up weather for {location}")
+        async for chunk in original_stream:
+            yield chunk
 
-        return "sunny with a temperature of 70 degrees."
+            if chunk.delta.content:
+                sentences = sentence_processor.process(chunk.delta.content)
+                for sentence in sentences:
+                    logger.info(f'[FxAssistant] [Sentence] 输出完整句子: "{sentence}"')
+                    asyncio.create_task(self.api_client.send_task(sentence))
 
+        remaining_text = sentence_processor.flush()
+        if remaining_text:
+            logger.info(f'[FxAssistant] [Sentence] 输出结尾部分: "{remaining_text}"')
+            asyncio.create_task(self.api_client.send_task(remaining_text))
 
 def prewarm(proc: JobProcess):
+    """在 Agent 启动工作前预加载资源。"""
+    logger.info("[Agent] Prewarming VAD model...")
     proc.userdata["vad"] = silero.VAD.load()
-
+    logger.info("[Agent] VAD model loaded.")
 
 async def entrypoint(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
-    }
+    """入口点"""
+    metadata = json.loads(ctx.job.metadata or "{}")
+    logger.info(f"[Agent] Received job with metadata: {metadata}")
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
-    session = AgentSession(
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all providers at https://docs.livekit.io/agents/integrations/llm/
-        llm=openai.LLM(model="gpt-4o-mini"),
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all providers at https://docs.livekit.io/agents/integrations/stt/
-        stt=deepgram.STT(model="nova-3", language="multi"),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all providers at https://docs.livekit.io/agents/integrations/tts/
-        tts=cartesia.TTS(voice="6f84f4b8-58a2-430c-8c79-688dad597532"),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
+    token = metadata.get("token", "")
+    session_id = metadata.get("sessionId", "")
+    api_client = FxHumanApiClient(token=token, session_id=session_id)
+    
+    session = voice.AgentSession(
+        # vad=ctx.proc.userdata["vad"],
+        # stt=openai.STT(model="whisper-1"),
+        # llm=openai.LLM(model="gpt-4o-mini"),
+        # tts=openai.TTS(model="tts-1", voice="alloy"),
+        llm=openai.realtime.RealtimeModel(),
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead:
-    # session = AgentSession(
-    #     # See all providers at https://docs.livekit.io/agents/integrations/realtime/
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(event: voice.ConversationItemAddedEvent):
+        """
+        当消息提交到历史消息的时候
+        """
+        logger.info(f"Conversation item added from {event.item.role}: {event.item.text_content}. interrupted: {event.item.interrupted}")
+        for content in event.item.content:
+            if isinstance(content, str):
+                logger.info(f" - text: {content}")
+            elif isinstance(content, ImageContent):
+                logger.info(f" - image: {content.image}")
+            elif isinstance(content, AudioContent):
+                logger.info(f" - audio: {content.frame}, transcript: {content.transcript}")
 
-    # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
-    # when it's detected, you may resume the agent's speech
-    @session.on("agent_false_interruption")
-    def _on_agent_false_interruption(ev: AgentFalseInterruptionEvent):
-        logger.info("false positive interruption, resuming")
-        session.generate_reply(instructions=ev.extra_instructions or NOT_GIVEN)
+    fx_assistant = FxAssistant(api_client=api_client)
 
-    # Metrics collection, to measure pipeline performance
-    # For more information, see https://docs.livekit.io/agents/build/metrics/
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
-
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/integrations/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/integrations/avatar/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
-
-    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(),
+        # agent=fx_assistant,
+        agent=Agent(instructions="You are a helpful voice AI assistant."),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            # LiveKit Cloud enhanced noise cancellation
-            # - If self-hosting, omit this parameter
-            # - For telephony applications, use `BVCTelephony` for best results
-            noise_cancellation=noise_cancellation.BVC(),
-        ),
+        room_output_options=RoomOutputOptions(audio_enabled=False),
     )
 
-    # Join the room and connect to the user
     await ctx.connect()
+    logger.info(f"[Agent] Connected to room {ctx.room.name}, waiting for participant...")
 
+async def request_fnc(req: JobRequest):
+    await req.accept(
+        name="agent-fx-human-ai",
+        identity=os.getenv("AGENT_IDENTITY", "agent-fx-human-ai-identity"),
+        attributes={"agent": "fx-human-ai"},
+        metadata="{'agent': 'fx-human-ai'}",
+    )
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            request_fnc=request_fnc,
+            prewarm_fnc=prewarm,
+            agent_name=os.getenv("AGENT_NAME", "firstx01"),
+        )
+    )
